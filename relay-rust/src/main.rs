@@ -365,8 +365,33 @@ fn cmd_run(
     routes: Option<&str>,
     port: u16,
 ) -> Result<(), CommandExecutionError> {
-    // start in parallel so that the relay server is ready when the client connects
+    // Start the client immediately, then monitor for reconnections
     async_start(serial, dns_servers, routes, port);
+
+    // Spawn a monitor thread that detects device reconnections and re-establishes
+    // the tunnel automatically (e.g. after USB mode changes or cable replug)
+    {
+        let monitor_serial = serial.map(String::from);
+        let monitor_dns_servers = dns_servers.map(String::from);
+        let monitor_routes = routes.map(String::from);
+        thread::spawn(move || {
+            let mut adb_monitor = AdbMonitor::new(Box::new(move |serial: &str| {
+                let target_serial = monitor_serial.as_ref().map(String::as_ref);
+                let dns_servers = monitor_dns_servers.as_ref().map(String::as_ref);
+                let routes = monitor_routes.as_ref().map(String::as_ref);
+                // Only restart for our target device (or any device if no serial specified)
+                if target_serial.is_none() || target_serial == Some(serial) {
+                    info!(
+                        target: TAG,
+                        "Device {} reconnected, re-establishing tunnel...",
+                        serial
+                    );
+                    async_start(Some(serial), dns_servers, routes, port);
+                }
+            }));
+            adb_monitor.monitor();
+        });
+    }
 
     let ctrlc_serial = serial.map(String::from);
     ctrlc::set_handler(move || {
@@ -458,8 +483,14 @@ fn cmd_start(
         }
     }
 
-    info!(target: TAG, "Starting client...");
+    info!(
+        target: TAG,
+        "Starting client{}...",
+        serial.map_or(String::new(), |s| format!(" for device {}", s))
+    );
+    info!(target: TAG, "Setting up adb reverse tunnel on port {}...", port);
     cmd_tunnel(serial, port)?;
+    info!(target: TAG, "Tunnel established, launching VPN client on device...");
 
     let mut adb_args = vec![
         "shell",
@@ -524,8 +555,20 @@ fn cmd_tunnel(serial: Option<&str>, port: u16) -> Result<(), CommandExecutionErr
 
 fn cmd_relay(port: u16) -> Result<(), CommandExecutionError> {
     info!(target: TAG, "Starting relay server on port {}...", port);
-    relaylib::relay(port)?;
-    Ok(())
+    match relaylib::relay(port) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                error!(
+                    target: TAG,
+                    "Port {} is already in use. Another relay may be running. \
+                     Kill it with 'pkill -f gnirehtet' or use a different port with '-p'.",
+                    port
+                );
+            }
+            Err(e.into())
+        }
+    }
 }
 
 fn async_start(serial: Option<&str>, dns_servers: Option<&str>, routes: Option<&str>, port: u16) {
@@ -537,7 +580,12 @@ fn async_start(serial: Option<&str>, dns_servers: Option<&str>, routes: Option<&
         let dns_servers = start_dns_servers.as_ref().map(String::as_ref);
         let routes = start_routes.as_ref().map(String::as_ref);
         if let Err(err) = cmd_start(serial, dns_servers, routes, port) {
-            error!(target: TAG, "Cannot start client: {}", err);
+            error!(
+                target: TAG,
+                "Cannot start client{}: {}. Try reconnecting the device or running 'gnirehtet tunnel' manually.",
+                serial.map_or(String::new(), |s| format!(" ({})", s)),
+                err
+            );
         }
     });
 }
