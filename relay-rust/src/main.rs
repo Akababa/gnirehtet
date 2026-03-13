@@ -29,6 +29,8 @@ use crate::adb_monitor::AdbMonitor;
 use crate::cli_args::CommandLineArguments;
 use crate::execution_error::{Cmd, CommandExecutionError, ProcessIoError, ProcessStatusError};
 use std::env;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::process::{self, exit};
 use std::thread;
 use std::time::Duration;
@@ -379,7 +381,25 @@ fn cmd_run(
     })
     .expect("Error setting Ctrl-C handler");
 
-    cmd_relay(port)
+    if is_relay_running(port) {
+        info!(
+            target: TAG,
+            "Relay server already running on port {}, reusing existing instance",
+            port
+        );
+        // Keep the process alive until Ctrl+C (handled above)
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    } else {
+        cmd_relay(port)
+    }
+}
+
+fn is_relay_running(port: u16) -> bool {
+    use std::net::TcpStream;
+    let addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), port);
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
 fn cmd_autorun(
@@ -409,10 +429,33 @@ fn cmd_start(
     port: u16,
 ) -> Result<(), CommandExecutionError> {
     if must_install_client(serial)? {
-        cmd_install(serial)?;
-        // wait a bit after the app is installed so that intent actions are correctly
-        // registered
-        thread::sleep(Duration::from_millis(500));
+        let apk_path = get_apk_path();
+        if Path::new(&apk_path).exists() {
+            cmd_install(serial)?;
+            // wait a bit after the app is installed so that intent actions are correctly
+            // registered
+            thread::sleep(Duration::from_millis(500));
+        } else if is_client_installed(serial) {
+            warn!(
+                target: TAG,
+                "APK file '{}' not found, but client is already installed (possibly a different \
+                 version). Skipping install.",
+                apk_path
+            );
+        } else {
+            error!(
+                target: TAG,
+                "APK file '{}' not found and client is not installed. \
+                 Set GNIREHTET_APK to the correct path.",
+                apk_path
+            );
+            let cmd = Cmd::new("adb", vec!["install", "-r", &apk_path]);
+            return Err(ProcessIoError::new(
+                cmd,
+                std::io::Error::new(std::io::ErrorKind::NotFound, "APK file not found"),
+            )
+            .into());
+        }
     }
 
     info!(target: TAG, "Starting client...");
@@ -531,6 +574,20 @@ fn exec_adb<S: Into<String>>(
             let cmd = Cmd::new(adb, adb_args);
             Err(ProcessIoError::new(cmd, err).into())
         }
+    }
+}
+
+fn is_client_installed(serial: Option<&str>) -> bool {
+    let args = create_adb_args(
+        serial,
+        vec!["shell", "pm", "list", "packages", "com.genymobile.gnirehtet"],
+    );
+    let adb = get_adb_path();
+    if let Ok(output) = process::Command::new(&adb).args(&args[..]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.contains("package:com.genymobile.gnirehtet")
+    } else {
+        false
     }
 }
 
